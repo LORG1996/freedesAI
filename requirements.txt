@@ -1,0 +1,10 @@
+streamlit
+streamlit-cropper
+torch
+torchvision
+pillow
+ultralytics
+sentence-transformers
+transformers
+timm
+numpy
