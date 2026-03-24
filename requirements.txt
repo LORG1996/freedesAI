@@ -1,5 +1,6 @@
 streamlit
 streamlit-cropper
+streamlit_paste_button
 torch
 torchvision
 pillow
