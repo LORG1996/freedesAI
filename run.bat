@@ -1,5 +1,4 @@
 @echo off
-cd /d "%~dp0"
 echo --------------------------------------------------
 echo Checking libraries and starting Freedes AI search...
 echo --------------------------------------------------
