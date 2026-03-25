@@ -10,3 +10,4 @@ transformers
 timm
 numpy
 pywin32
+miro-api
