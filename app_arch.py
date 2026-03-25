@@ -3,6 +3,7 @@ import re
 import pickle
 import requests
 import torch
+import json
 import streamlit as st
 from PIL import Image
 import pythoncom
@@ -18,7 +19,7 @@ from streamlit_cropper import st_cropper
 from streamlit_paste_button import paste_image_button
 
 # --- 1. КОНФІГУРАЦІЯ ---
-os.environ["HF_TOKEN"] = "ВАШ ТОКЕН"
+os.environ["HF_TOKEN"] = "ваш токен"
 st.set_page_config(page_title="Freedes AI render search", layout="wide")
 
 DATABASE_FOLDER = 'my_renders'
@@ -52,14 +53,17 @@ def load_models():
 detector, clip_model, dino_processor, dino_model = load_models()
 
 def get_miro_images(board_id, api_token):
-    """Завантаження ОРИГІНАЛІВ з Miro з ПОВНИМ логуванням у консоль"""
+    """Завантаження ОРИГІНАЛІВ (HD) з Miro з ПОВНИМ логуванням у консоль"""
     headers = {"Authorization": f"Bearer {api_token}", "Accept": "application/json"}
+    # Початковий URL для отримання списку ітемів
     url = f"https://api.miro.com/v2/boards/{board_id}/items?type=image&limit=50"
+    
     count = 0
     skipped = 0
     
     print(f"\n🌐 ПІДКЛЮЧЕННЯ ДО MIRO BOARD: {board_id}")
-    print("-" * 50)
+    print(f"🚀 РЕЖИМ: ЗАВАНТАЖЕННЯ МАКСИМАЛЬНОЇ ЯКОСТІ (HD)")
+    print("-" * 60)
     
     try:
         while url:
@@ -69,35 +73,73 @@ def get_miro_images(board_id, api_token):
                 break
             
             data = response.json()
-            for item in data.get('data', []):
-                item_id, item_data = item.get('id'), item.get('data', {})
+            items = data.get('data', [])
+            
+            for item in items:
+                item_id = item.get('id')
+                item_data = item.get('data', {})
                 temp_url_meta = item_data.get('imageUrl')
                 
                 if temp_url_meta:
-                    res_meta = requests.get(temp_url_meta, headers=headers)
+                    # --- КЛЮЧОВИЙ ХАК №1: Заміна preview на original ---
+                    high_res_url = temp_url_meta.replace("format=preview", "format=original")
+                    
+                    # Запит метаданих (Miro часто повертає JSON з посиланням на S3)
+                    res_meta = requests.get(high_res_url, headers=headers)
+                    
                     if res_meta.status_code == 200:
-                        final_url = res_meta.json().get('url')
-                        name = item_data.get('title') or f"render_{item_id[-4:]}"
-                        clean_name = re.sub(r'[\\/*?:"<>|]', "", str(name))[:40]
-                        final_filename = f"{clean_name}_{item_id[-4:]}.jpg"
+                        content_type = res_meta.headers.get('Content-Type', '')
+                        
+                        # --- КЛЮЧОВИЙ ХАК №2: Обробка JSON-редиректу ---
+                        if "application/json" in content_type:
+                            meta_json = res_meta.json()
+                            # Пріоритет на originalUrl, потім на звичайний url
+                            final_download_url = meta_json.get('originalUrl') or meta_json.get('url')
+                        else:
+                            # Якщо одразу прийшла картинка (рідко для HD)
+                            final_download_url = high_res_url
+
+                        if not final_download_url:
+                            print(f"⚠️ Не вдалося знайти посилання для ID: {item_id}")
+                            continue
+
+                        # Формування імені файлу
+                        name = item_data.get('title') or f"render_{item_id[-6:]}"
+                        clean_name = re.sub(r'[\\/*?:"<>|]', "", str(name)).strip()[:40]
+                        # Визначаємо розширення (можна було б додати перевірку байтів, але зазвичай PNG/JPG)
+                        final_filename = f"{clean_name}_{item_id[-4:]}.png"
                         file_path = os.path.join(DATABASE_FOLDER, final_filename)
 
                         if not os.path.exists(file_path):
-                            print(f"📥 Завантаження: {final_filename}...", end=" ", flush=True)
-                            img_data = requests.get(final_url).content
-                            with open(file_path, 'wb') as f:
-                                f.write(img_data)
-                            print("✅ OK")
-                            count += 1
+                            print(f"📥 HQ Завантаження: {final_filename}...", end=" ", flush=True)
+                            
+                            # Фінальне завантаження бінарних даних
+                            img_res = requests.get(final_download_url)
+                            if img_res.status_code == 200:
+                                img_bytes = img_res.content
+                                with open(file_path, 'wb') as f:
+                                    f.write(img_bytes)
+                                
+                                size_kb = len(img_bytes) // 1024
+                                print(f"✅ OK ({size_kb} KB)")
+                                count += 1
+                            else:
+                                print(f"❌ Помилка завантаження файлу: {img_res.status_code}")
                         else:
                             print(f"⏩ Скіп (вже є): {final_filename}")
                             skipped += 1
+                
+            # Пагінація: перехід до наступної порції ітемів (якщо > 50)
             url = data.get('links', {}).get('next')
-        print("-" * 50)
-        print(f"📊 ПІДСУМОК: Нових: {count} | Пропущено: {skipped}")
+            
+        print("-" * 60)
+        print(f"📊 ПІДСУМОК: Нових HQ: {count} | Пропущено: {skipped}")
         return count, None
+
     except Exception as e:
-        print(f"‼️ Критична помилка: {e}")
+        print(f"\n‼️ Критична помилка: {e}")
+        import traceback
+        traceback.print_exc() # Виведе повний шлях помилки в консоль
         return count, str(e)
 
 def get_image_embedding(image):
