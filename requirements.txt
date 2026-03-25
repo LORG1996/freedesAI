@@ -1,6 +1,6 @@
 streamlit
 streamlit-cropper
-streamlit_paste_button
+streamlit-paste-button
 torch
 torchvision
 pillow
@@ -9,3 +9,4 @@ sentence-transformers
 transformers
 timm
 numpy
+pywin32
