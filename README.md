@@ -4,6 +4,8 @@
 ![AI](https://img.shields.io/badge/AI-CLIP%20%7C%20DINOv2%20%7C%20YOLOv8-orange.svg)
 ![Field](https://img.shields.io/badge/Industry-Architecture%20%26%20Design-green.svg)
 
+![Freedes AI Banner](./assets/banner.png)
+
 **Інтелектуальна екосистема для архітекторів та візуалізаторів.** Система дозволяє миттєво знаходити потрібні ракурси, матеріали або об'єкти у вашій локальній базі рендерів за допомогою нейромереж.
 
 ---
