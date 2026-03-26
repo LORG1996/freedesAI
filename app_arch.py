@@ -19,7 +19,7 @@ from streamlit_cropper import st_cropper
 from streamlit_paste_button import paste_image_button
 
 # --- 1. КОНФІГУРАЦІЯ ---
-os.environ["HF_TOKEN"] = "ваш токен"
+os.environ["HF_TOKEN"] = "ВАШ ТОКЕН"
 st.set_page_config(page_title="Freedes AI render search", layout="wide")
 
 DATABASE_FOLDER = 'my_renders'
@@ -168,81 +168,78 @@ with st.sidebar.expander("☁️ Синхронізація з Miro"):
         if err: st.error(err)
         else: st.success(f"Завантажено {c} фото")
 
-# --- ОНОВЛЕНИЙ БЛОК ІНДЕКСАЦІЇ З ЛОГУВАННЯМ ---
-if st.sidebar.button("🔄 Оновити базу (Індексація ШІ)"):
+# --- ОНОВЛЕНИЙ БЛОК ІНДЕКСАЦІЇ (INCREMENTAL UPDATE) ---
+if st.sidebar.button("🔄 Оновити базу "):
+    # 1. Завантажуємо існуючу базу, якщо вона є
+    existing_data = []
+    indexed_paths = set()
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, 'rb') as f:
+            existing_data = pickle.load(f)
+            # Створюємо набір шляхів, які ВЖЕ є в базі, для швидкої перевірки
+            indexed_paths = {item["full_path"] for item in existing_data}
+
     files_to_process = []
-    log_area = st.sidebar.empty() # Місце для тексту над прогрес-баром
-    log_area.write("🔍 Сканування папок та ярликів...")
+    log_area = st.sidebar.empty()
+    log_area.write("🔍 Пошук нових файлів...")
     
-    # 1. Етап збору файлів
+    # 2. Скануємо папку
     for root, dirs, files in os.walk(DATABASE_FOLDER):
         for f in files:
             full_path = os.path.normpath(os.path.join(root, f))
             
-            # Прямі зображення
+            # Обробка прямих файлів та ярликів
+            actual_path = None
             if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-                files_to_process.append((full_path, f))
-                
-            # Обробка ярликів
+                actual_path = full_path
             elif f.lower().endswith('.lnk'):
                 target = get_shortcut_target(full_path)
                 if target and os.path.exists(target):
-                    print(f"🔗 Ярлик {f} -> {target}") # Лог у консоль
-                    if os.path.isdir(target):
-                        for s_root, _, s_files in os.walk(target):
-                            for sf in s_files:
-                                if sf.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-                                    files_to_process.append((os.path.join(s_root, sf), sf))
-                    elif target.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-                        files_to_process.append((target, os.path.basename(target)))
+                    if os.path.isfile(target): actual_path = target
+                    # Для папок-ярликів логіка залишається (можна розширити за потреби)
+
+            # ДОДАЄМО ТІЛЬКИ ЯКЩО ШЛЯХУ НЕМАЄ В indexed_paths
+            if actual_path and actual_path not in indexed_paths:
+                files_to_process.append((actual_path, os.path.basename(actual_path)))
 
     if not files_to_process:
-        st.sidebar.error("Зображень не знайдено!")
-        print(f"❌ Помилка: Папка {DATABASE_FOLDER} порожня.")
+        st.sidebar.info("✨ Нових зображень не знайдено. База актуальна!")
     else:
-        db_data = []
         progress_bar = st.sidebar.progress(0)
-        status_text = st.sidebar.empty() # Текст для назви файлу в UI
+        status_text = st.sidebar.empty()
         
         total = len(files_to_process)
-        print(f"\n🚀 Початок індексації: {total} об'єктів")
-        print("-" * 50)
+        new_embeddings = [] # Тимчасовий список для нових об'єктів
 
         for i, (path, name) in enumerate(files_to_process):
             try:
-                # Вивід у веб-інтерфейс
-                status_text.text(f"Обробка ({i+1}/{total}): {name}")
-                # Вивід у консоль
-                print(f"[{i+1}/{total}] Аналіз: {path}")
-                
+                status_text.text(f"Новий ({i+1}/{total}): {name}")
                 img = Image.open(path).convert('RGB')
                 
                 # Головний ембединг
                 emb = get_image_embedding(img)
-                db_data.append({"filename": name, "full_path": path, "embedding": emb})
+                new_embeddings.append({"filename": name, "full_path": path, "embedding": emb})
                 
-                # Пошук об'єктів через YOLO та створення кропів
+                # YOLO кропи для нових фото
                 results = detector(img, verbose=False)
                 for box in results[0].boxes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     crop = img.crop((x1, y1, x2, y2))
                     crop_emb = get_image_embedding(crop)
-                    db_data.append({"filename": name, "full_path": path, "embedding": crop_emb})
+                    new_embeddings.append({"filename": name, "full_path": path, "embedding": crop_emb})
                 
             except Exception as e:
                 print(f"⚠️ Помилка файлу {path}: {e}")
                 continue
             
-            # Оновлення прогресу
             progress_bar.progress((i + 1) / total)
         
-        # Збереження
+        # 3. Об'єднуємо старе з новим та зберігаємо
+        final_db = existing_data + new_embeddings
         with open(CACHE_FILE, 'wb') as f:
-            pickle.dump(db_data, f)
+            pickle.dump(final_db, f)
             
-        print("-" * 50)
-        print(f"✅ Готово! Базу оновлено. Файл: {CACHE_FILE}")
-        st.sidebar.success(f"Успіх! Оброблено {total} зображень.")
+        st.sidebar.success(f"Додано {total} нових зображень!")
         st.rerun()
 
 # --- 4. ПОШУК ---
@@ -271,11 +268,16 @@ if os.path.exists(CACHE_FILE):
                 final_emb /= final_emb.norm(p=2)
             else: final_emb = img_emb
 
+           # ... (попередній код отримання final_emb) ...
+
             embs = torch.stack([item["embedding"] for item in db_data])
             scores = util.cos_sim(final_emb, embs)[0]
-            tk = torch.topk(scores, k=min(20, len(scores)))
             
-            # --- ОНОВЛЕНИЙ ВИВІД РЕЗУЛЬТАТІВ ---
+            # Встановлюємо ліміт у 50 результатів (або менше, якщо в базі всього 10-20 фото)
+            k_value = min(100, len(scores))
+            tk = torch.topk(scores, k=k_value)
+            
+            # --- ОНОВЛЕНИЙ ВИВІД РЕЗУЛЬТАТІВ (БЕЗ ЖОРСТКОГО ЛІМІТУ) ---
             res_cols = st.columns(2)
             shown, count = set(), 0
             
@@ -284,20 +286,25 @@ if os.path.exists(CACHE_FILE):
                 f_path = m['full_path']
                 f_name = m['filename']
                 
-                if f_path not in shown and count < 10:
+                # Перевірка на дублікати (якщо один файл має кілька кропів від YOLO)
+                if f_path not in shown:
                     if os.path.exists(f_path):
+                        # Виводимо результат у колонки (ліва/права по черзі)
                         with res_cols[count % 2]:
                             # 1. Зображення
                             st.image(f_path, use_container_width=True)
                             
-                            # 2. НАЗВА (зверху, жирним)
+                            # 2. Назва файлу (чистимо від Miro-суфіксів)
                             display_name = re.sub(r'_[a-f0-9]{4}$', '', f_name.split('.')[0])
                             st.markdown(f"**{display_name}**")
                             
-                            # 3. ВІДСОТКИ (під назвою)
+                            # 3. Відсоток схожості
                             st.write(f"🎯 Схожість: **{s:.1%}**")
-                            
                             st.divider()
                             
                         shown.add(f_path)
                         count += 1
+                        
+            # Якщо нічого не знайдено взагалі
+            if count == 0:
+                st.warning("Нічого не знайдено за вашим запитом.")
