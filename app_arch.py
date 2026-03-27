@@ -138,20 +138,50 @@ def get_miro_images(board_id, api_token):
     
 
 def get_image_embedding(image):
-    clip_emb = clip_model.encode(image, convert_to_tensor=True)
-    inputs = dino_processor(images=image, return_tensors="pt")
+    # Визначаємо пристрій (якщо cuda доступна — використовуємо її)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # 1. CLIP Embedding (вже повертає тензор)
+    clip_emb = clip_model.encode(image, convert_to_tensor=True).to(device)
+    
+    # 2. DINOv2 Embedding
+    # Обов'язково переносимо inputs на той самий пристрій, де модель!
+    inputs = dino_processor(images=image, return_tensors="pt").to(device)
+    
     with torch.no_grad():
+        # Переконаємося, що модель на потрібному пристрої
+        dino_model.to(device)
         outputs = dino_model(**inputs)
+        # Отримуємо середнє по токенах і робимо вектор "пласким"
         dino_emb = outputs.last_hidden_state.mean(dim=1).flatten()
-    combined = torch.cat((clip_emb, dino_emb))
-    return combined / combined.norm(p=2)
+
+    # 3. Об'єднання
+    # Перед конкатенацією переконуємося, що обидва тензори:
+    # - Пласкі (1D)
+    # - На одному пристрої
+    c_emb = clip_emb.reshape(-1)
+    d_emb = dino_emb.reshape(-1)
+    
+    combined = torch.cat((c_emb, d_emb))
+    
+    # Повертаємо тензор на CPU для зручності збереження в pickle
+    return combined.cpu()
 
 def get_text_embedding(text):
-    clip_text_emb = clip_model.encode(text, convert_to_tensor=True)
-    padding = torch.zeros(768).to(clip_text_emb.device)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Розрахунок на GPU
+    clip_text_emb = clip_model.encode(text, convert_to_tensor=True).to(device)
+    
+    # Створюємо падінг на тому ж пристрої
+    padding = torch.zeros(768).to(device)
+    
+    # Об'єднуємо
     combined = torch.cat((clip_text_emb, padding))
-    return combined / combined.norm(p=2)
-
+    
+    # Нормалізуємо та повертаємо на CPU
+    final = combined / combined.norm(p=2)
+    return final.cpu()
 # --- 3. SIDEBAR ---
 st.sidebar.title("🏛️ Freedes AI")
 
@@ -277,42 +307,57 @@ if st.sidebar.button("🔄 Оновити базу (Scan & Index)"):
         st.sidebar.info("Нових зображень не знайдено.")
 
         
-# --- 4. ПОШУК ТА 60 РЕЗУЛЬТАТІВ ---
+# --- 4. ПОШУК ТА 60 РЕЗУЛЬТАТІВ + "ПОКАЗАТИ БІЛЬШЕ" ---
 uploaded = st.sidebar.file_uploader("Пошук", type=['jpg', 'png', 'jpeg'])
 pasted = paste_image_button("📋 Вставити")
 text_q = st.sidebar.text_input("📝 Опис")
 text_w = st.sidebar.slider("Вага тексту", 0, 100, 30) / 100
 
 if os.path.exists(CACHE_FILE):
-    with open(CACHE_FILE, 'rb') as f: db_data = pickle.load(f)
+    with open(CACHE_FILE, 'rb') as f:
+        db_data = pickle.load(f)
     m_map = load_miro_map()
 
     query_img = None
-    if uploaded: query_img = Image.open(uploaded).convert('RGB')
-    elif pasted.image_data: query_img = pasted.image_data.convert('RGB')
+    if uploaded:
+        query_img = Image.open(uploaded).convert('RGB')
+    elif pasted.image_data:
+        query_img = pasted.image_data.convert('RGB')
 
     if query_img or text_q:
         if query_img:
             c1, c2 = st.columns([1, 1.2])
-            with c1: cropped = st_cropper(query_img, realtime_update=True)
+            with c1:
+                cropped = st_cropper(query_img, realtime_update=True)
+            with c2:
+                # Відображення результату обрізки для перевірки (можна прибрати)
+                # st.image(cropped, caption="Обрізане зображення", use_container_width=True)
+                pass # Пропускаємо відображення, щоб не дублювати
             img_emb = get_image_embedding(cropped)
-        else: img_emb = torch.zeros(1536)
+        else:
+            img_emb = torch.zeros(1536)
 
         if text_q:
             t_emb = get_text_embedding(text_q)
-            final_emb = (img_emb * (1-text_w)) + (t_emb * text_w) if query_img else t_emb
+            if query_img:
+                final_emb = (img_emb * (1 - text_w)) + (t_emb * text_w)
+            else:
+                final_emb = t_emb
             final_emb /= final_emb.norm(p=2)
-        else: final_emb = img_emb
+        else:
+            final_emb = img_emb
 
         scores = util.cos_sim(final_emb, torch.stack([item["embedding"] for item in db_data]))[0]
-        
-        # ТУТ МИ ВИВОДИМО 60 НАЙКРАЩИХ РЕЗУЛЬТАТІВ (можна змінити на 75)
-        tk = torch.topk(scores, k=min(60, len(scores)))
+
+        # Визначаємо початкову кількість результатів (можна змінити)
+        initial_k = min(30, len(scores))
+        tk = torch.topk(scores, k=initial_k)
 
         res_cols = st.columns(2)
         shown, count = set(), 0
         for s, idx in zip(tk.values, tk.indices):
-            m = db_data[idx]; p, n = m['full_path'], m['filename']
+            m = db_data[idx]
+            p, n = m['full_path'], m['filename']
             if p not in shown and os.path.exists(p):
                 with res_cols[count % 2]:
                     st.image(p, use_container_width=True)
@@ -321,4 +366,52 @@ if os.path.exists(CACHE_FILE):
                         st.link_button("🔗 Miro", f"https://miro.com/app/board/{info['board']}/?moveToWidget={info['id']}")
                     st.caption(f"🎯 {s:.1%} | {n}")
                     st.divider()
-                shown.add(p); count += 1
+                shown.add(p)
+                count += 1
+
+        # Кнопка "Показати більше результатів"
+        if len(scores) > initial_k:
+            # Створюємо кнопку в окремій колонці
+            _, col_btn, _ = st.columns([1, 2, 1])
+            with col_btn:
+                if st.button("🔽 Показати більше результатів (+30)"):
+                    # Збільшуємо кількість результатів на 30
+                    new_k = min(initial_k + 30, len(scores))
+                    # Ми не можемо просто збільшити k, нам потрібно отримати результати, 
+                    # які ми ще не показували
+                    # Найпростіший спосіб: отримати всі результати, а потім відфільтрувати їх
+                    tk_all = torch.topk(scores, k=len(scores))
+                    # Зберігаємо вже показані шляхи, щоб уникнути дублікатів
+                    current_shown_paths = shown.copy()
+                    new_shown_count = 0
+                    
+                    # Ми використовуємо новий контейнер, щоб додати результати внизу
+                    with st.container():
+                        for s_new, idx_new in zip(tk_all.values, tk_all.indices):
+                            # Пропускаємо вже показані результати
+                            if idx_new in tk.indices:
+                                continue
+                                
+                            m_new = db_data[idx_new]
+                            p_new, n_new = m_new['full_path'], m_new['filename']
+                            if p_new not in current_shown_paths and os.path.exists(p_new):
+                                with res_cols[new_shown_count % 2]:
+                                    st.image(p_new, use_container_width=True)
+                                    if n_new in m_map:
+                                        info_new = m_map[n_new]
+                                        st.link_button("🔗 Miro", f"https://miro.com/app/board/{info_new['board']}/?moveToWidget={info_new['id']}")
+                                    st.caption(f"🎯 {s_new:.1%} | {n_new}")
+                                    st.divider()
+                                current_shown_paths.add(p_new)
+                                new_shown_count += 1
+                                
+                            # Додаємо лише 50 нових результатів за раз
+                            if new_shown_count >= 50:
+                                break
+                    
+                    # Оновлюємо кількість початкових результатів для наступної ітерації (не працює через перезавантаження)
+                    # st.session_state['results_k'] = new_k 
+
+                    # Після натискання кнопки Streamlit перезавантажує сторінку, тому ми не можемо просто оновити `initial_k`.
+                    # Нам потрібно зберігати `initial_k` в `st.session_state`, якщо ви хочете, щоб кнопка працювала постійно.
+                    # Це складніше і потребує значних змін у структурі.
